@@ -21,11 +21,28 @@ pub const DEFAULT_MC_PORT: u16 = 25565;
 /// Lowest public port a client is allowed to claim. Ports must be strictly above this.
 pub const MIN_USER_PORT: u16 = 1000;
 
-/// Maximum byte length for a JSON frame in the stream.
-pub const MAX_FRAME_LENGTH: usize = 256;
+/// Maximum byte length for a JSON frame in the stream. Large enough to carry a
+/// `Listen`/`Bound` for a client that registers many routes at once.
+pub const MAX_FRAME_LENGTH: usize = 8 * 1024;
 
 /// Timeout for network connections and initial protocol messages.
 pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Total wall-clock budget for reading a player's Minecraft handshake. This is a
+/// hard ceiling on the whole read loop (not per-read like [`NETWORK_TIMEOUT`]),
+/// so a slowloris that dribbles bytes can't pin a public connection open.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One route a client wants to expose: a public port and an optional sub-label.
+/// The relay registers `[label.]subdomain.<base>` on `port` and proxies it to the
+/// backend the client paired with this route.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteSpec {
+    /// Public port to expose (must be above [`MIN_USER_PORT`]).
+    pub port: u16,
+    /// Optional sub-label, e.g. `survival` in `survival.name.tunnel.birdflop.com`.
+    pub label: Option<String>,
+}
 
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,13 +58,12 @@ pub enum ClientMessage {
     /// Answer to an authentication challenge (HMAC of the challenge under the token).
     Answer(String),
 
-    /// After authenticating, claim a public port (and optional sub-label) to
-    /// forward. The relay routes `[label.]subdomain.<base>` on this port to here.
+    /// After authenticating, claim one or more routes to forward. Each route is an
+    /// independent `[label.]subdomain.<base>` on its own port, all multiplexed over
+    /// this single control connection.
     Listen {
-        /// Public port to expose (must be above [`MIN_USER_PORT`]).
-        port: u16,
-        /// Optional sub-label, e.g. `survival` in `survival.name.tunnel.birdflop.com`.
-        label: Option<String>,
+        /// The routes to register. Must be non-empty.
+        routes: Vec<RouteSpec>,
     },
 
     /// Accepts an incoming TCP connection, using this stream as a proxy.
@@ -72,16 +88,29 @@ pub enum ServerMessage {
     /// Confirms a successful existing-identity authentication.
     Authenticated,
 
-    /// Confirms a [`ClientMessage::Listen`], carrying the public address that
-    /// players should connect to (e.g. `a3k9zq.tunnel.birdflop.com` or
+    /// Confirms a [`ClientMessage::Listen`], carrying the public address for each
+    /// requested route, in the same order (e.g. `a3k9zq.tunnel.birdflop.com` or
     /// `survival.a3k9zq.tunnel.birdflop.com:25566`).
-    Bound(String),
+    Bound {
+        /// One public address per registered route, in request order.
+        addresses: Vec<String>,
+    },
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,
 
-    /// Asks the client to accept a forwarded TCP connection.
-    Connection(Uuid),
+    /// Asks the client to accept a forwarded TCP connection. `hostname` and
+    /// `port` together identify the route the player connected to, so a
+    /// multi-route client knows which local backend to dial. Both are needed:
+    /// two routes can share a hostname but differ by port (and vice versa).
+    Connection {
+        /// Identifier the client echoes back in [`ClientMessage::Accept`].
+        id: Uuid,
+        /// The matched route's hostname (e.g. `survival.a3k9zq.tunnel.birdflop.com`).
+        hostname: String,
+        /// The public port the player connected on.
+        port: u16,
+    },
 
     /// Indicates a server error that terminates the connection.
     Error(String),

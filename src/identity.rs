@@ -89,6 +89,11 @@ impl IdentityStore {
         let identity = data.identities.get(subdomain)?;
         hex::decode(&identity.token_hash).ok()
     }
+
+    /// Number of identities currently issued.
+    pub fn count(&self) -> usize {
+        self.data.lock().unwrap().identities.len()
+    }
 }
 
 fn persist(path: &Path, data: &StoreData) -> Result<()> {

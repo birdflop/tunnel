@@ -1,12 +1,14 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use anyhow::Result;
-use birdflop_tunnel::client::Client;
+use anyhow::{Context, Result};
+use birdflop_tunnel::client::{Client, Route};
 use birdflop_tunnel::identity::IdentityStore;
 use birdflop_tunnel::server::Server;
 use birdflop_tunnel::shared::{CONTROL_PORT, DEFAULT_MC_PORT};
 use clap::{error::ErrorKind, CommandFactory, Parser, Subcommand};
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 #[clap(name = "bftunnel", author, version, about)]
@@ -17,11 +19,11 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Forward a local Minecraft server through the relay.
+    /// Forward one or more local Minecraft servers through the relay.
     Local {
-        /// The local port to expose.
+        /// The local port to expose. Omit when using --config.
         #[clap(env = "BFTUNNEL_LOCAL_PORT")]
-        local_port: u16,
+        local_port: Option<u16>,
 
         /// The local host to expose.
         #[clap(short, long, value_name = "HOST", default_value = "localhost")]
@@ -42,6 +44,10 @@ enum Command {
         /// Optional sub-label, e.g. `survival` in `survival.<you>.tunnel.birdflop.com`.
         #[clap(long)]
         label: Option<String>,
+
+        /// JSON file listing multiple routes; supersedes the single-route flags.
+        #[clap(long, value_name = "PATH")]
+        config: Option<PathBuf>,
 
         /// Your subdomain (paired with --token). Omit both to request a new identity.
         #[clap(long, env = "BFTUNNEL_SUBDOMAIN")]
@@ -81,7 +87,90 @@ enum Command {
         /// IP address public tunnel listeners bind to, defaults to --bind-addr.
         #[clap(long)]
         bind_tunnels: Option<IpAddr>,
+
+        /// Serve Prometheus metrics on this address, e.g. `127.0.0.1:9090` (off by default).
+        #[clap(long, value_name = "ADDR", env = "BFTUNNEL_METRICS_ADDR")]
+        metrics_addr: Option<SocketAddr>,
+
+        /// Max total identities to issue (0 = unlimited).
+        #[clap(long, default_value_t = 0, env = "BFTUNNEL_MAX_IDENTITIES")]
+        max_identities: usize,
+
+        /// Max simultaneously pending (un-accepted) player connections.
+        #[clap(long, default_value_t = 1024, env = "BFTUNNEL_MAX_PENDING")]
+        max_pending: usize,
+
+        /// Max routes (ports/labels) one identity may hold at once.
+        #[clap(long, default_value_t = 10, env = "BFTUNNEL_MAX_TUNNELS_PER_IDENTITY")]
+        max_tunnels_per_identity: usize,
+
+        /// Max new-identity registrations allowed per source IP per minute.
+        #[clap(long, default_value_t = 5, env = "BFTUNNEL_REGISTER_RATE")]
+        register_rate: u32,
     },
+}
+
+/// One route entry in a client `--config` file.
+#[derive(Debug, Deserialize)]
+struct RouteConfig {
+    label: Option<String>,
+    local_host: Option<String>,
+    local_port: u16,
+    public_port: Option<u16>,
+}
+
+/// Top-level client `--config` file shape.
+#[derive(Debug, Deserialize)]
+struct ClientConfig {
+    routes: Vec<RouteConfig>,
+}
+
+fn load_routes(
+    config: Option<PathBuf>,
+    local_port: Option<u16>,
+    local_host: String,
+    port: u16,
+    label: Option<String>,
+) -> Result<Vec<Route>> {
+    if let Some(path) = config {
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading route config {}", path.display()))?;
+        let cfg: ClientConfig = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing route config {}", path.display()))?;
+        if cfg.routes.is_empty() {
+            Args::command()
+                .error(ErrorKind::InvalidValue, "config has no routes")
+                .exit();
+        }
+        Ok(cfg
+            .routes
+            .into_iter()
+            .map(|r| Route {
+                label: r.label,
+                public_port: r.public_port.unwrap_or(DEFAULT_MC_PORT),
+                local_host: r.local_host.unwrap_or_else(|| "localhost".to_string()),
+                local_port: r.local_port,
+            })
+            .collect())
+    } else {
+        let local_port = match local_port {
+            Some(p) => p,
+            None => {
+                Args::command()
+                    .error(
+                        ErrorKind::MissingRequiredArgument,
+                        "a local_port is required unless --config is given",
+                    )
+                    .exit();
+            }
+        };
+        Ok(vec![Route {
+            label,
+            public_port: port,
+            local_host,
+            local_port,
+        }])
+    }
 }
 
 #[tokio::main]
@@ -94,6 +183,7 @@ async fn run(command: Command) -> Result<()> {
             control_port,
             port,
             label,
+            config,
             subdomain,
             token,
         } => {
@@ -110,22 +200,17 @@ async fn run(command: Command) -> Result<()> {
                 }
             };
 
-            let client = Client::new(
-                &local_host,
-                local_port,
-                &to,
-                control_port,
-                port,
-                label.as_deref(),
-                identity,
-            )
-            .await?;
+            let routes = load_routes(config, local_port, local_host, port, label)?;
+
+            let client = Client::new(&to, control_port, routes, identity).await?;
 
             // On first run, print the issued identity so the caller can persist it.
             if let Some((subdomain, token)) = client.issued() {
                 println!("BFTUNNEL_IDENTITY subdomain={subdomain} token={token}");
             }
-            println!("BFTUNNEL_ADDRESS {}", client.address());
+            for address in client.addresses() {
+                println!("BFTUNNEL_ADDRESS {address}");
+            }
 
             client.listen().await?;
         }
@@ -137,6 +222,11 @@ async fn run(command: Command) -> Result<()> {
             control_port,
             bind_addr,
             bind_tunnels,
+            metrics_addr,
+            max_identities,
+            max_pending,
+            max_tunnels_per_identity,
+            register_rate,
         } => {
             let port_range = min_port..=max_port;
             if port_range.is_empty() {
@@ -149,6 +239,13 @@ async fn run(command: Command) -> Result<()> {
             server.set_bind_addr(bind_addr);
             server.set_bind_tunnels(bind_tunnels.unwrap_or(bind_addr));
             server.set_control_port(control_port);
+            server.set_max_identities(max_identities);
+            server.set_max_pending(max_pending);
+            server.set_max_per_identity(max_tunnels_per_identity);
+            server.set_register_rate(register_rate, Duration::from_secs(60));
+            if let Some(addr) = metrics_addr {
+                server.set_metrics_addr(addr);
+            }
             server.listen().await?;
         }
     }
