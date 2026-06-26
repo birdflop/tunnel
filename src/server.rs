@@ -26,7 +26,8 @@ use crate::identity::IdentityStore;
 use crate::metrics::Metrics;
 use crate::shared::{
     is_valid_label, parse_handshake_hostname, ClientMessage, Delimited, HandshakeParse, RouteSpec,
-    ServerMessage, CONTROL_PORT, DEFAULT_MC_PORT, HANDSHAKE_TIMEOUT, MIN_USER_PORT, NETWORK_TIMEOUT,
+    ServerMessage, CONTROL_PORT, DEFAULT_MC_PORT, HANDSHAKE_TIMEOUT, MIN_USER_PORT,
+    NETWORK_TIMEOUT,
 };
 
 /// How often the relay sends a heartbeat on each idle control connection. This
@@ -372,7 +373,9 @@ impl Server {
                     warn!(ip = %addr.ip(), "registration rate limit hit");
                     self.metrics.registration_rate_limited();
                     stream
-                        .send(ServerMessage::Error("registration rate limit exceeded".into()))
+                        .send(ServerMessage::Error(
+                            "registration rate limit exceeded".into(),
+                        ))
                         .await?;
                     return Ok(());
                 }

@@ -226,7 +226,9 @@ async fn multi_route_routes_by_label() -> Result<()> {
     // A player connecting to survival.<sub> on its port reaches the survival backend.
     let survival_host = format!("survival.{subdomain}.{BASE}");
     let mut player = TcpStream::connect(("localhost", survival_port)).await?;
-    player.write_all(&handshake(&survival_host, survival_port)).await?;
+    player
+        .write_all(&handshake(&survival_host, survival_port))
+        .await?;
     let mut reply = [0u8; 9];
     player.read_exact(&mut reply).await?;
     assert_eq!(&reply, b"survival!");
@@ -234,7 +236,9 @@ async fn multi_route_routes_by_label() -> Result<()> {
     // And creative.<sub> reaches the creative backend.
     let creative_host = format!("creative.{subdomain}.{BASE}");
     let mut player = TcpStream::connect(("localhost", creative_port)).await?;
-    player.write_all(&handshake(&creative_host, creative_port)).await?;
+    player
+        .write_all(&handshake(&creative_host, creative_port))
+        .await?;
     let mut reply = [0u8; 9];
     player.read_exact(&mut reply).await?;
     assert_eq!(&reply, b"creative!");
@@ -278,10 +282,7 @@ async fn multi_route_by_port_no_label() -> Result<()> {
     let client = Client::new(
         "localhost",
         control_port,
-        vec![
-            route(local_a, port_a, None),
-            route(local_b, port_b, None),
-        ],
+        vec![route(local_a, port_a, None), route(local_b, port_b, None)],
         None,
     )
     .await?;
