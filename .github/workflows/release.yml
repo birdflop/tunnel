@@ -1,0 +1,44 @@
+name: release
+
+# Push a version tag (e.g. `git tag v0.1.0 && git push origin v0.1.0`) to build
+# cross-platform binaries and publish them on a GitHub release for that tag.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+
+permissions:
+  contents: write
+
+jobs:
+  upload-assets:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the binary (using `cross` for Linux cross-targets), archives it as
+      # `bftunnel-<target>.zip` on Windows / `.tar.gz` elsewhere with the binary at
+      # the archive root, and uploads it to the release — exactly what the Server
+      # Manager app expects when downloading bftunnel.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: bftunnel
+          target: ${{ matrix.target }}
+          archive: $bin-$target
+          tar: unix
+          zip: windows
+          token: ${{ secrets.GITHUB_TOKEN }}

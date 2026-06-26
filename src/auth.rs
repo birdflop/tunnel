@@ -1,21 +1,31 @@
-//! Auth implementation for bore client and server.
+//! HMAC challenge/response used to prove ownership of a token.
+//!
+//! The relay never needs the plaintext token: it stores only `SHA-256(token)`,
+//! which is exactly the HMAC key, and builds an [`Authenticator`] from that with
+//! [`Authenticator::from_key`]. The client builds the same authenticator from the
+//! plaintext token with [`Authenticator::new`]. The relay sends a random
+//! challenge and the client returns its HMAC, so the token never crosses the wire
+//! after it is first issued.
 
-use anyhow::{bail, ensure, Result};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-use crate::shared::{ClientMessage, Delimited, ServerMessage};
-
-/// Wrapper around a MAC used for authenticating clients that have a secret.
+/// Wrapper around a MAC used for authenticating clients that have a token.
 pub struct Authenticator(Hmac<Sha256>);
 
 impl Authenticator {
-    /// Generate an authenticator from a secret.
+    /// Generate an authenticator from a plaintext secret (e.g. a token).
     pub fn new(secret: &str) -> Self {
         let hashed_secret = Sha256::new().chain_update(secret).finalize();
-        Self(Hmac::new_from_slice(&hashed_secret).expect("HMAC can take key of any size"))
+        Self::from_key(&hashed_secret)
+    }
+
+    /// Build an authenticator directly from an already-hashed key (the SHA-256
+    /// of the secret). This lets the relay validate clients while only storing
+    /// the hash of each token at rest — never the plaintext secret.
+    pub fn from_key(hashed_secret: &[u8]) -> Self {
+        Self(Hmac::new_from_slice(hashed_secret).expect("HMAC can take key of any size"))
     }
 
     /// Generate a reply message for a challenge.
@@ -28,7 +38,7 @@ impl Authenticator {
     /// Validate a reply to a challenge.
     ///
     /// ```
-    /// use bore_cli::auth::Authenticator;
+    /// use birdflop_tunnel::auth::Authenticator;
     /// use uuid::Uuid;
     ///
     /// let auth = Authenticator::new("secret");
@@ -46,34 +56,26 @@ impl Authenticator {
             false
         }
     }
+}
 
-    /// As the server, send a challenge to the client and validate their response.
-    pub async fn server_handshake<T: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: &mut Delimited<T>,
-    ) -> Result<()> {
+#[cfg(test)]
+mod tests {
+    use super::Authenticator;
+    use sha2::{Digest, Sha256};
+    use uuid::Uuid;
+
+    #[test]
+    fn from_key_matches_new() {
+        // The relay builds an authenticator from SHA-256(token); the client from
+        // the plaintext token. They must produce matching HMACs.
+        let token = "a-very-secret-token";
+        let key = Sha256::digest(token.as_bytes());
+
+        let client = Authenticator::new(token);
+        let server = Authenticator::from_key(&key);
         let challenge = Uuid::new_v4();
-        stream.send(ServerMessage::Challenge(challenge)).await?;
-        match stream.recv_timeout().await? {
-            Some(ClientMessage::Authenticate(tag)) => {
-                ensure!(self.validate(&challenge, &tag), "invalid secret");
-                Ok(())
-            }
-            _ => bail!("server requires secret, but no secret was provided"),
-        }
-    }
 
-    /// As the client, answer a challenge to attempt to authenticate with the server.
-    pub async fn client_handshake<T: AsyncRead + AsyncWrite + Unpin>(
-        &self,
-        stream: &mut Delimited<T>,
-    ) -> Result<()> {
-        let challenge = match stream.recv_timeout().await? {
-            Some(ServerMessage::Challenge(challenge)) => challenge,
-            _ => bail!("expected authentication challenge, but no secret was required"),
-        };
-        let tag = self.answer(&challenge);
-        stream.send(ClientMessage::Authenticate(tag)).await?;
-        Ok(())
+        assert!(server.validate(&challenge, &client.answer(&challenge)));
+        assert!(!server.validate(&challenge, &Authenticator::new("wrong").answer(&challenge)));
     }
 }

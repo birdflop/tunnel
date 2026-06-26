@@ -5,6 +5,6 @@ COPY . .
 RUN cargo install --path .
 
 FROM scratch
-COPY --from=builder /usr/local/cargo/bin/bore .
+COPY --from=builder /usr/local/cargo/bin/bftunnel .
 USER 1000:1000
-ENTRYPOINT ["./bore"]
+ENTRYPOINT ["./bftunnel"]

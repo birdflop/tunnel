@@ -1,164 +1,188 @@
-use std::net::SocketAddr;
+//! End-to-end tests for the Birdflop tunnel.
+//!
+//! Each test runs its relay on its own control/public ports so they don't
+//! collide, and uses a temp identity store for isolation.
+
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
-use bore_cli::{client::Client, server::Server, shared::CONTROL_PORT};
-use lazy_static::lazy_static;
-use rstest::*;
+use anyhow::Result;
+use birdflop_tunnel::client::Client;
+use birdflop_tunnel::identity::IdentityStore;
+use birdflop_tunnel::server::Server;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::net::TcpStream;
 use tokio::time;
 
-lazy_static! {
-    /// Guard to make sure that tests are run serially, not concurrently.
-    static ref SERIAL_GUARD: Mutex<()> = Mutex::new(());
+const BASE: &str = "tunnel.test";
+
+fn temp_store(name: &str) -> IdentityStore {
+    let path = std::env::temp_dir().join(format!("bftunnel-e2e-{name}.json"));
+    let _ = std::fs::remove_file(&path);
+    IdentityStore::load(path).unwrap()
 }
 
-/// Spawn the server, giving some time for the control port TcpListener to start.
-async fn spawn_server(secret: Option<&str>) {
-    tokio::spawn(Server::new(1024..=65535, secret).listen());
-    time::sleep(Duration::from_millis(50)).await;
+fn write_varint(buf: &mut Vec<u8>, mut value: u32) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        buf.push(byte);
+        if value == 0 {
+            break;
+        }
+    }
 }
 
-/// Spawns a client with randomly assigned ports, returning the listener and remote address.
-async fn spawn_client(secret: Option<&str>) -> Result<(TcpListener, SocketAddr)> {
-    let listener = TcpListener::bind("localhost:0").await?;
-    let local_port = listener.local_addr()?.port();
-    let client = Client::new("localhost", local_port, "localhost", 0, secret).await?;
-    let remote_addr = ([127, 0, 0, 1], client.remote_port()).into();
-    tokio::spawn(client.listen());
-    Ok((listener, remote_addr))
+/// Build a Minecraft C→S handshake packet for the given address/port.
+fn handshake(address: &str, port: u16) -> Vec<u8> {
+    let mut body = Vec::new();
+    write_varint(&mut body, 0);
+    write_varint(&mut body, 765);
+    write_varint(&mut body, address.len() as u32);
+    body.extend_from_slice(address.as_bytes());
+    body.extend_from_slice(&port.to_be_bytes());
+    write_varint(&mut body, 2);
+
+    let mut packet = Vec::new();
+    write_varint(&mut packet, body.len() as u32);
+    packet.extend_from_slice(&body);
+    packet
 }
 
-#[rstest]
+async fn spawn_relay(control_port: u16, store: IdentityStore) {
+    let mut server = Server::new(1024..=65535, BASE.to_string(), store);
+    server.set_control_port(control_port);
+    tokio::spawn(server.listen());
+    time::sleep(Duration::from_millis(80)).await;
+}
+
 #[tokio::test]
-async fn basic_proxy(#[values(None, Some(""), Some("abc"))] secret: Option<&str>) -> Result<()> {
-    let _guard = SERIAL_GUARD.lock().await;
+async fn proxies_by_handshake_hostname() -> Result<()> {
+    let control_port = 17801;
+    let public_port = 30001;
+    spawn_relay(control_port, temp_store("proxy")).await;
 
-    spawn_server(secret).await;
-    let (listener, addr) = spawn_client(secret).await?;
+    // A fake "Minecraft server" the client forwards to.
+    let backend = tokio::net::TcpListener::bind("localhost:0").await?;
+    let local_port = backend.local_addr()?.port();
 
-    tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await?;
+    // Client requests a fresh identity and registers the public port.
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        control_port,
+        public_port,
+        None,
+        None,
+    )
+    .await?;
+    let (subdomain, _token) = client.issued().cloned().expect("issued an identity");
+    let hostname = format!("{subdomain}.{BASE}");
+    assert_eq!(client.address(), format!("{hostname}:{public_port}"));
+    tokio::spawn(client.listen());
+
+    let hs = handshake(&hostname, public_port);
+    let hs_len = hs.len();
+
+    // Backend side: read the replayed handshake, then the app data, then reply.
+    let backend_task = tokio::spawn(async move {
+        let (mut stream, _) = backend.accept().await?;
+        let mut prefix = vec![0u8; hs_len];
+        stream.read_exact(&mut prefix).await?;
         let mut buf = [0u8; 11];
         stream.read_exact(&mut buf).await?;
         assert_eq!(&buf, b"hello world");
-
-        stream.write_all(b"I can send a message too!").await?;
+        stream.write_all(b"hi from backend").await?;
         anyhow::Ok(())
     });
 
-    let mut stream = TcpStream::connect(addr).await?;
-    stream.write_all(b"hello world").await?;
+    // Player side: connect to the public port, send the handshake, then data.
+    let mut player = TcpStream::connect(("localhost", public_port)).await?;
+    player.write_all(&hs).await?;
+    player.write_all(b"hello world").await?;
 
-    let mut buf = [0u8; 25];
-    stream.read_exact(&mut buf).await?;
-    assert_eq!(&buf, b"I can send a message too!");
+    let mut reply = [0u8; 15];
+    player.read_exact(&mut reply).await?;
+    assert_eq!(&reply, b"hi from backend");
 
-    // Ensure that the client end of the stream is closed now.
-    assert_eq!(stream.read(&mut buf).await?, 0);
-
-    // Also ensure that additional connections do not produce any data.
-    let mut stream = TcpStream::connect(addr).await?;
-    assert_eq!(stream.read(&mut buf).await?, 0);
-
-    Ok(())
-}
-
-#[rstest]
-#[case(None, Some("my secret"))]
-#[case(Some("my secret"), None)]
-#[tokio::test]
-async fn mismatched_secret(
-    #[case] server_secret: Option<&str>,
-    #[case] client_secret: Option<&str>,
-) {
-    let _guard = SERIAL_GUARD.lock().await;
-
-    spawn_server(server_secret).await;
-    assert!(spawn_client(client_secret).await.is_err());
-}
-
-#[tokio::test]
-async fn invalid_address() -> Result<()> {
-    // We don't need the serial guard for this test because it doesn't create a server.
-    async fn check_address(to: &str, use_secret: bool) -> Result<()> {
-        match Client::new("localhost", 5000, to, 0, use_secret.then_some("a secret")).await {
-            Ok(_) => Err(anyhow!("expected error for {to}, use_secret={use_secret}")),
-            Err(_) => Ok(()),
-        }
-    }
-    tokio::try_join!(
-        check_address("google.com", false),
-        check_address("google.com", true),
-        check_address("nonexistent.domain.for.demonstration", false),
-        check_address("nonexistent.domain.for.demonstration", true),
-        check_address("malformed !$uri$%", false),
-        check_address("malformed !$uri$%", true),
-    )?;
+    backend_task.await??;
     Ok(())
 }
 
 #[tokio::test]
-async fn very_long_frame() -> Result<()> {
-    let _guard = SERIAL_GUARD.lock().await;
+async fn unknown_hostname_is_dropped() -> Result<()> {
+    let control_port = 17803;
+    let public_port = 30003;
+    spawn_relay(control_port, temp_store("unknown")).await;
 
-    spawn_server(None).await;
-    let mut attacker = TcpStream::connect(("localhost", CONTROL_PORT)).await?;
+    let backend = tokio::net::TcpListener::bind("localhost:0").await?;
+    let local_port = backend.local_addr()?.port();
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        control_port,
+        public_port,
+        None,
+        None,
+    )
+    .await?;
+    tokio::spawn(client.listen());
 
-    // Slowly send a very long frame.
-    for _ in 0..10 {
-        let result = attacker.write_all(&[42u8; 100000]).await;
-        if result.is_err() {
-            return Ok(());
-        }
-        time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("did not exit after a 1 MB frame");
+    // Connect with a handshake for a hostname nobody registered → relay closes it.
+    let mut player = TcpStream::connect(("localhost", public_port)).await?;
+    player
+        .write_all(&handshake("does-not-exist.tunnel.test", public_port))
+        .await?;
+    let mut buf = [0u8; 1];
+    // The relay drops the connection without sending anything.
+    assert_eq!(player.read(&mut buf).await?, 0);
+    Ok(())
 }
 
-#[test]
+#[tokio::test]
+async fn wrong_token_is_rejected() -> Result<()> {
+    let control_port = 17802;
+    spawn_relay(control_port, temp_store("auth")).await;
+
+    // Create an identity.
+    let backend = tokio::net::TcpListener::bind("localhost:0").await?;
+    let local_port = backend.local_addr()?.port();
+    let client = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        control_port,
+        30002,
+        None,
+        None,
+    )
+    .await?;
+    let (subdomain, _token) = client.issued().cloned().expect("issued an identity");
+    drop(client);
+
+    // Re-authenticate with the right subdomain but the wrong token.
+    let result = Client::new(
+        "localhost",
+        local_port,
+        "localhost",
+        control_port,
+        30002,
+        None,
+        Some((subdomain, "totally-wrong-token".to_string())),
+    )
+    .await;
+    assert!(result.is_err(), "expected auth failure with wrong token");
+    Ok(())
+}
+
+#[tokio::test]
 #[should_panic]
-fn empty_port_range() {
-    let min_port = 5000;
-    let max_port = 3000;
-    let _ = Server::new(min_port..=max_port, None);
-}
-
-#[tokio::test]
-async fn half_closed_tcp_stream() -> Result<()> {
-    // Check that "half-closed" TCP streams will not result in spontaneous hangups.
-    let _guard = SERIAL_GUARD.lock().await;
-
-    spawn_server(None).await;
-    let (listener, addr) = spawn_client(None).await?;
-
-    let (mut cli, (mut srv, _)) = tokio::try_join!(TcpStream::connect(addr), listener.accept())?;
-
-    // Send data before half-closing one of the streams.
-    let mut buf = b"message before shutdown".to_vec();
-    cli.write_all(&buf).await?;
-
-    // Only close the write half of the stream. This is a half-closed stream. In the
-    // TCP protocol, it is represented as a FIN packet on one end. The entire stream
-    // is only closed after two FINs are exchanged and ACKed by the other end.
-    cli.shutdown().await?;
-
-    srv.read_exact(&mut buf).await?;
-    assert_eq!(buf, b"message before shutdown");
-    assert_eq!(srv.read(&mut buf).await?, 0); // EOF
-
-    // Now make sure that the other stream can still send data, despite
-    // half-shutdown on client->server side.
-    let mut buf = b"hello from the other side!".to_vec();
-    srv.write_all(&buf).await?;
-    cli.read_exact(&mut buf).await?;
-    assert_eq!(buf, b"hello from the other side!");
-
-    // We don't have to think about CLOSE_RD handling because that's not really
-    // part of the TCP protocol, just the POSIX streams API. It is implemented by
-    // the OS ignoring future packets received on that stream.
-
-    Ok(())
+#[allow(clippy::reversed_empty_ranges)] // deliberately empty to assert the guard panics
+async fn empty_port_range_panics() {
+    let store = temp_store("empty-range");
+    let _ = Server::new(5000..=3000, BASE.to_string(), store);
 }

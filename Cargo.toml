@@ -1,18 +1,21 @@
 [package]
-name = "bore-cli"
-version = "0.6.0"
-authors = ["Eric Zhang <ekzhang1@gmail.com>"]
+name = "birdflop-tunnel"
+version = "0.1.0"
+authors = ["Birdflop"]
 license = "MIT"
-description = "A modern, simple TCP tunnel in Rust that exposes local ports to a remote server, bypassing standard NAT connection firewalls."
-repository = "https://github.com/ekzhang/bore"
-documentation = "https://docs.rs/bore-cli"
-keywords = ["network", "cli", "tunnel", "tcp"]
-categories = ["network-programming", "web-programming", "command-line-utilities"]
+description = "Self-hosted Minecraft tunnel that gives each user a stable *.tunnel.birdflop.com subdomain and routes traffic by the Minecraft handshake. Based on bore by Eric Zhang."
+repository = "https://github.com/birdflop/tunnel"
+keywords = ["network", "cli", "tunnel", "tcp", "minecraft"]
+categories = ["network-programming", "command-line-utilities"]
 readme = "README.md"
 edition = "2021"
 
+[lib]
+name = "birdflop_tunnel"
+path = "src/lib.rs"
+
 [[bin]]
-name = "bore"
+name = "bftunnel"
 path = "src/main.rs"
 
 [dependencies]
@@ -26,7 +29,7 @@ hmac = "0.12.1"
 serde = { version = "1.0.136", features = ["derive"] }
 serde_json = "1.0.79"
 sha2 = "0.10.2"
-tokio = { version = "1.17.0", features = ["rt-multi-thread", "io-util", "macros", "net", "time"] }
+tokio = { version = "1.17.0", features = ["rt-multi-thread", "io-util", "macros", "net", "time", "sync"] }
 tokio-util = { version = "0.7.1", features = ["codec"] }
 tracing = "0.1.32"
 tracing-subscriber = "0.3.18"

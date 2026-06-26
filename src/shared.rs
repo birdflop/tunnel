@@ -11,8 +11,15 @@ use tokio_util::codec::{AnyDelimiterCodec, Framed, FramedParts};
 use tracing::trace;
 use uuid::Uuid;
 
-/// TCP port used for control connections with the server.
+/// TCP port used for control connections with the relay.
 pub const CONTROL_PORT: u16 = 7835;
+
+/// Default public Minecraft port. A player who types just `name.tunnel.birdflop.com`
+/// (no port) connects here, so we always keep a host-mux listener open on it.
+pub const DEFAULT_MC_PORT: u16 = 25565;
+
+/// Lowest public port a client is allowed to claim. Ports must be strictly above this.
+pub const MIN_USER_PORT: u16 = 1000;
 
 /// Maximum byte length for a JSON frame in the stream.
 pub const MAX_FRAME_LENGTH: usize = 256;
@@ -23,24 +30,52 @@ pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// A message from the client on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// Response to an authentication challenge from the server.
+    /// Request a brand-new identity. The relay issues a subdomain + token and
+    /// treats this connection as authenticated for that subdomain.
+    Register,
+
+    /// Authenticate as an existing identity, named by its (public) subdomain.
+    /// The relay replies with a [`ServerMessage::Challenge`].
     Authenticate(String),
 
-    /// Initial client message specifying a port to forward.
-    Hello(u16),
+    /// Answer to an authentication challenge (HMAC of the challenge under the token).
+    Answer(String),
+
+    /// After authenticating, claim a public port (and optional sub-label) to
+    /// forward. The relay routes `[label.]subdomain.<base>` on this port to here.
+    Listen {
+        /// Public port to expose (must be above [`MIN_USER_PORT`]).
+        port: u16,
+        /// Optional sub-label, e.g. `survival` in `survival.name.tunnel.birdflop.com`.
+        label: Option<String>,
+    },
 
     /// Accepts an incoming TCP connection, using this stream as a proxy.
     Accept(Uuid),
 }
 
-/// A message from the server on the control connection.
+/// A message from the relay on the control connection.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Authentication challenge, sent as the first message, if enabled.
+    /// A newly issued identity, in response to [`ClientMessage::Register`]. The
+    /// token is plaintext and shown to the user only this once.
+    Issued {
+        /// The assigned public subdomain (e.g. `a3k9zq`).
+        subdomain: String,
+        /// The secret token used to re-authenticate later. Store it; never share it.
+        token: String,
+    },
+
+    /// Authentication challenge, in response to [`ClientMessage::Authenticate`].
     Challenge(Uuid),
 
-    /// Response to a client's initial message, with actual public port.
-    Hello(u16),
+    /// Confirms a successful existing-identity authentication.
+    Authenticated,
+
+    /// Confirms a [`ClientMessage::Listen`], carrying the public address that
+    /// players should connect to (e.g. `a3k9zq.tunnel.birdflop.com` or
+    /// `survival.a3k9zq.tunnel.birdflop.com:25566`).
+    Bound(String),
 
     /// No-op used to test if the client is still reachable.
     Heartbeat,
@@ -50,6 +85,113 @@ pub enum ServerMessage {
 
     /// Indicates a server error that terminates the connection.
     Error(String),
+}
+
+/// Whether a string is a valid single DNS label (sub-name) we'll accept.
+pub fn is_valid_label(label: &str) -> bool {
+    let len = label.len();
+    if len == 0 || len > 63 {
+        return false;
+    }
+    if label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Outcome of trying to parse a Minecraft handshake from a partial buffer.
+pub enum HandshakeParse {
+    /// Parsed successfully; carries the (normalized) server address the player typed.
+    Ok(String),
+    /// Not enough bytes yet — read more and try again.
+    NeedMore,
+    /// Not a valid modern Minecraft handshake.
+    Invalid,
+}
+
+/// Read a Minecraft-style VarInt from `buf` at `*pos`, advancing `*pos` on success.
+/// Returns `None` if the buffer ends mid-VarInt (caller should read more) or if
+/// it is malformed (more than 5 bytes).
+fn read_varint(buf: &[u8], pos: &mut usize) -> Option<i32> {
+    let mut result: i32 = 0;
+    let mut shift = 0u32;
+    let mut cur = *pos;
+    loop {
+        let byte = *buf.get(cur)?;
+        cur += 1;
+        result |= ((byte & 0x7f) as i32) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+        shift += 7;
+        if shift >= 35 {
+            return None; // malformed VarInt
+        }
+    }
+    *pos = cur;
+    Some(result)
+}
+
+/// Try to extract the server address from the first packet of a Minecraft
+/// connection (the C→S Handshake, packet id 0x00).
+///
+/// The handshake layout is: VarInt packet length, then a body of
+/// `[VarInt id=0][VarInt protocol][String address][u16 port][VarInt next-state]`.
+/// We only need `address`. FML/Forge and proxy-forwarding clients append extra
+/// data after a NUL byte, so we keep only the part before the first NUL, strip a
+/// trailing dot, and lowercase it.
+pub fn parse_handshake_hostname(buf: &[u8]) -> HandshakeParse {
+    // Legacy (pre-1.7) ping starts with 0xFE — not supported.
+    if buf.first() == Some(&0xFE) {
+        return HandshakeParse::Invalid;
+    }
+
+    let mut pos = 0;
+    let packet_len = match read_varint(buf, &mut pos) {
+        Some(v) if v > 0 => v as usize,
+        Some(_) => return HandshakeParse::Invalid,
+        None => return HandshakeParse::NeedMore,
+    };
+    if packet_len > 1024 {
+        return HandshakeParse::Invalid; // a handshake is tiny; this isn't one
+    }
+    if buf.len() - pos < packet_len {
+        return HandshakeParse::NeedMore;
+    }
+
+    let packet = &buf[pos..pos + packet_len];
+    let mut p = 0;
+    match read_varint(packet, &mut p) {
+        Some(0) => {} // handshake packet id
+        _ => return HandshakeParse::Invalid,
+    }
+    if read_varint(packet, &mut p).is_none() {
+        return HandshakeParse::Invalid; // protocol version
+    }
+    let addr_len = match read_varint(packet, &mut p) {
+        Some(v) if v >= 0 => v as usize,
+        _ => return HandshakeParse::Invalid,
+    };
+    if addr_len > 255 || p + addr_len > packet.len() {
+        return HandshakeParse::Invalid;
+    }
+    let addr = match std::str::from_utf8(&packet[p..p + addr_len]) {
+        Ok(s) => s,
+        Err(_) => return HandshakeParse::Invalid,
+    };
+
+    let hostname = addr
+        .split('\0')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if hostname.is_empty() {
+        return HandshakeParse::Invalid;
+    }
+    HandshakeParse::Ok(hostname)
 }
 
 /// Transport stream with JSON frames delimited by null characters.
@@ -95,5 +237,85 @@ impl<U: AsyncRead + AsyncWrite + Unpin> Delimited<U> {
     /// Consume this object, returning current buffers and the inner transport.
     pub fn into_parts(self) -> FramedParts<U, AnyDelimiterCodec> {
         self.0.into_parts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_valid_label, parse_handshake_hostname, HandshakeParse};
+
+    fn write_varint(buf: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            buf.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Build a Minecraft C→S handshake packet for the given address/port.
+    pub fn handshake(address: &str, port: u16) -> Vec<u8> {
+        let mut body = Vec::new();
+        write_varint(&mut body, 0); // packet id (handshake)
+        write_varint(&mut body, 765); // protocol version
+        write_varint(&mut body, address.len() as u32);
+        body.extend_from_slice(address.as_bytes());
+        body.extend_from_slice(&port.to_be_bytes());
+        write_varint(&mut body, 2); // next state: login
+
+        let mut packet = Vec::new();
+        write_varint(&mut packet, body.len() as u32);
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    #[test]
+    fn parses_hostname() {
+        let pkt = handshake("a3k9zq.tunnel.birdflop.com", 25565);
+        match parse_handshake_hostname(&pkt) {
+            HandshakeParse::Ok(host) => assert_eq!(host, "a3k9zq.tunnel.birdflop.com"),
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn strips_forge_suffix_and_lowercases() {
+        let pkt = handshake("Survival.A3K9ZQ.tunnel.birdflop.com\0FML2\0", 25566);
+        match parse_handshake_hostname(&pkt) {
+            HandshakeParse::Ok(host) => assert_eq!(host, "survival.a3k9zq.tunnel.birdflop.com"),
+            _ => panic!("expected Ok"),
+        }
+    }
+
+    #[test]
+    fn needs_more_when_truncated() {
+        let pkt = handshake("a3k9zq.tunnel.birdflop.com", 25565);
+        assert!(matches!(
+            parse_handshake_hostname(&pkt[..3]),
+            HandshakeParse::NeedMore
+        ));
+    }
+
+    #[test]
+    fn rejects_legacy_ping() {
+        assert!(matches!(
+            parse_handshake_hostname(&[0xFE, 0x01]),
+            HandshakeParse::Invalid
+        ));
+    }
+
+    #[test]
+    fn labels() {
+        assert!(is_valid_label("survival"));
+        assert!(is_valid_label("lobby-1"));
+        assert!(!is_valid_label("-bad"));
+        assert!(!is_valid_label("bad-"));
+        assert!(!is_valid_label("Has.Dot"));
+        assert!(!is_valid_label(""));
     }
 }
