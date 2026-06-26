@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/birdflop/tunnel/compare/v0.2.0...v0.2.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* formatting ([07dbb03](https://github.com/birdflop/tunnel/commit/07dbb03ce686bba96f80e7bdec70108c73f42480))
+
 ## [0.2.0](https://github.com/birdflop/tunnel/compare/v0.1.0...v0.2.0) (2026-06-26)
 
 
