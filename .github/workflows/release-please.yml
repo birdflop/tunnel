@@ -1,0 +1,71 @@
+name: release-please
+
+# release-please watches main for Conventional Commits and maintains a "release"
+# PR that bumps the version in Cargo.toml + Cargo.lock and updates CHANGELOG.md.
+# Merging that PR creates the GitHub release and the `v<version>` tag, and the
+# upload-assets job below then builds and attaches the cross-platform binaries.
+#
+# Note: the release tag is created with the default GITHUB_TOKEN, which by design
+# does NOT trigger other workflows (e.g. a separate `on: push: tags` build). That
+# is why the binary build lives here as a dependent job gated on `release_created`,
+# rather than in its own tag-triggered workflow.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  upload-assets:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      # Builds the binary (using `cross` for Linux cross-targets), archives it as
+      # `bftunnel-<target>.zip` on Windows / `.tar.gz` elsewhere with the binary at
+      # the archive root, and uploads it to the release release-please just created
+      # — exactly what the Server Manager app expects when downloading bftunnel.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: bftunnel
+          target: ${{ matrix.target }}
+          archive: $bin-$target
+          tar: unix
+          zip: windows
+          ref: refs/tags/${{ needs.release-please.outputs.tag_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
